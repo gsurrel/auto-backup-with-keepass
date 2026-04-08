@@ -1,0 +1,41 @@
+# =============================================================================
+# backup.service — systemd service unit
+#
+# Install: cp backup.service ~/.config/systemd/user/
+#          systemctl --user daemon-reload
+#          systemctl --user enable --now backup.timer
+#
+# The service is triggered by backup.timer (not run directly).
+# It requires a graphical session for the KeePass password prompt.
+# =============================================================================
+
+[Unit]
+Description=Automated SSH Backup
+# Wait until the network is up and a desktop session is present
+After=network-online.target graphical-session.target
+Wants=network-online.target
+# Don't run if on battery (optional — remove if you want battery backups)
+# ConditionACPower=true
+
+[Service]
+Type=oneshot
+
+# Script and config paths — adjust if you installed elsewhere
+ExecStart=%h/.local/bin/backup.sh
+
+# Set config directory explicitly (optional)
+# Environment=BACKUP_CONFIG_DIR=%h/.config/backup
+
+# Give the GUI password dialog time to appear
+TimeoutStartSec=5min
+
+# Keep logs: journalctl --user -u backup.service
+StandardOutput=journal
+StandardError=journal
+
+# Security hardening for user service
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

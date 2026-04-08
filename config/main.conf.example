@@ -1,0 +1,21 @@
+# =============================================================================
+# backup — main.conf
+# Permissions: chmod 600 ~/.config/backup/main.conf
+# =============================================================================
+
+# Path to your KeePass 2 database (.kdbx)
+KEEPASS_DB="$HOME/Documents/passwords.kdbx"
+
+# Root directory where all backups will be stored.
+# Each target gets its own subdirectory: $LOCAL_BACKUP_ROOT/<target_name>/
+LOCAL_BACKUP_ROOT="$HOME/Backups"
+
+# Default SSH key to use when a target doesn't specify one.
+SSH_KEY_DEFAULT="$HOME/.ssh/id_ed25519"
+
+# Optional: global bandwidth cap for all targets, in KB/s (0 = unlimited).
+# Individual targets can override this with their own BANDWIDTH_LIMIT.
+# BANDWIDTH_LIMIT=5000
+
+# Optional: extra SSH options applied to every connection.
+# SSH_GLOBAL_OPTS="-o StrictHostKeyChecking=accept-new"

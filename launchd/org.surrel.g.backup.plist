@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  org.surrel.g.backup.plist — macOS launchd agent
+  ============================================
+
+  Install:
+    cp org.surrel.g.backup.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/org.surrel.g.backup.plist
+
+  Check status:
+    launchctl list org.surrel.g.backup
+
+  View logs:
+    tail -f ~/Library/Logs/backup/stdout.log
+    tail -f ~/Library/Logs/backup/stderr.log
+
+  Run manually:
+    launchctl start org.surrel.g.backup
+
+  Unload:
+    launchctl unload ~/Library/LaunchAgents/org.surrel.g.backup.plist
+
+  Note: The script uses osascript to prompt for the KeePass password,
+  which requires a GUI session — this will NOT work if launched from
+  a headless/SSH session.
+-->
+<plist version="1.0">
+<dict>
+
+    <key>Label</key>
+    <string>org.surrel.g.backup</string>
+
+    <!-- Adjust path to wherever you installed backup.sh -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/YOUR_USERNAME/.local/bin/backup.sh</string>
+    </array>
+
+    <!-- Run daily at 02:00 -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>2</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <!-- Environment variables passed to the script -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/YOUR_USERNAME</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <!-- Optional: override config dir
+        <key>BACKUP_CONFIG_DIR</key>
+        <string>/Users/YOUR_USERNAME/.config/backup</string>
+        -->
+    </dict>
+
+    <!-- Log files -->
+    <key>StandardOutPath</key>
+    <string>/Users/YOUR_USERNAME/Library/Logs/backup/stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/YOUR_USERNAME/Library/Logs/backup/stderr.log</string>
+
+    <!-- Run even if the scheduled time was missed (e.g. machine was asleep) -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <!-- Require a network connection -->
+    <key>NetworkState</key>
+    <true/>
+
+    <!-- Restart on unexpected exit (up to 3 times) -->
+    <key>ThrottleInterval</key>
+    <integer>3600</integer>
+
+</dict>
+</plist>

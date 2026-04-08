@@ -1,0 +1,45 @@
+# =============================================================================
+# backup — target: webserver
+# File: ~/.config/backup/targets/webserver.conf
+# Permissions: chmod 600
+#
+# This server HAS rsync — fastest strategy.
+# =============================================================================
+
+# Human-readable name (defaults to filename without .conf)
+TARGET_NAME="webserver"
+
+# SSH connection details
+HOST="webserver.example.com"
+PORT="22"
+USER="deploy"
+
+# Remote directory to back up (trailing slash is handled by the script)
+REMOTE_DIR="/var/www/html"
+
+# Local destination directory.
+# Leave empty to use $LOCAL_BACKUP_ROOT/$TARGET_NAME
+# LOCAL_DIR="/mnt/external/webserver"
+
+# KeePass entry path for the SSH key password.
+# This is the path inside the KeePass database (e.g. "Servers/WebServer SSH Key")
+KEEPASS_ENTRY="Servers/WebServer SSH Key"
+
+# Path to the SSH private key for this target.
+# Defaults to SSH_KEY_DEFAULT from main.conf.
+SSH_KEY="$HOME/.ssh/id_ed25519_webserver"
+
+# Does the remote server have rsync installed?
+#   "true"  — always use rsync
+#   "false" — always use lftp/sshfs fallback
+#   ""      — auto-detect on each run (slight overhead, recommended if unsure)
+HAS_RSYNC="true"
+
+# Extra rsync options (appended after the defaults)
+# RSYNC_EXTRA_OPTS="--exclude='.cache/' --exclude='*.tmp'"
+
+# Bandwidth limit for this target in KB/s (0 = unlimited, overrides global)
+# BANDWIDTH_LIMIT=2000
+
+# Set to "false" to skip this target without removing the file
+ENABLED="true"

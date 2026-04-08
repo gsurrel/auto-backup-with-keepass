@@ -1,0 +1,33 @@
+# =============================================================================
+# backup — target: nas
+# File: ~/.config/backup/targets/nas.conf
+# Permissions: chmod 600
+#
+# This server does NOT have rsync — uses lftp mirror or sshfs+rsync.
+# =============================================================================
+
+TARGET_NAME="nas"
+
+HOST="192.168.1.50"
+PORT="22"
+USER="admin"
+
+REMOTE_DIR="/share/homes/backup"
+
+# Explicit local path (overrides LOCAL_BACKUP_ROOT default)
+LOCAL_DIR="/mnt/external-drive/nas-backup"
+
+KEEPASS_ENTRY="Home/NAS SSH Key"
+
+SSH_KEY="$HOME/.ssh/id_ed25519_nas"
+
+# Explicitly no rsync on this device
+HAS_RSYNC="false"
+
+# Extra lftp mirror options (appended after defaults)
+# LFTP_EXTRA_OPTS="set sftp:connect-program 'ssh -a -x'"
+
+# Throttle so the NAS isn't overwhelmed during the day
+BANDWIDTH_LIMIT="10000"
+
+ENABLED="true"
