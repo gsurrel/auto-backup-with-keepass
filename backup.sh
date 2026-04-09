@@ -15,6 +15,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 ulimit -c 0   # disable core dumps — script handles sensitive credentials
+umask 077     # all files/dirs created by this script are private by default
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
 
@@ -30,8 +31,11 @@ LOG_FILE="$LOG_DIR/backup-$(date +%Y-%m-%d).log"
 MASTER_PASSWORD=""
 SSH_AGENT_PID_STARTED=""   # PID of agent we launched (empty = we reused existing)
 TEMP_FILES=()              # Temp files to clean up on exit
+SSHFS_MOUNT=""             # Set by backup_sshfs_rsync; unmounted by cleanup
 EXIT_CODE=0
-LOCK_FILE="${TMPDIR:-/tmp}/backup.lock"
+# Lock file lives in the user-private log dir (never world-writable /tmp)
+# It is created atomically via noclobber to avoid TOCTOU races.
+LOCK_FILE="${BACKUP_LOG_DIR:-$HOME/.local/share/backup}/backup.lock"
 
 # ─── Colour output (disabled when not a TTY) ──────────────────────────────────
 
@@ -45,6 +49,8 @@ fi
 # ─── Logging ──────────────────────────────────────────────────────────────────
 
 mkdir -p "$LOG_DIR"
+touch "$LOG_FILE"
+chmod 600 "$LOG_FILE"  # log may contain paths and error details
 
 log()  { local ts; ts="$(date '+%Y-%m-%d %H:%M:%S')"; echo -e "${C_CYAN}[${ts}]${C_RESET} $*" | tee -a "$LOG_FILE"; }
 info() { log "${C_GREEN}INFO${C_RESET}  $*"; }
@@ -56,6 +62,17 @@ die()  { err "$*"; exit 1; }
 
 cleanup() {
     local exit_status=$?
+
+    # Unmount sshfs if backup_sshfs_rsync left a mount point registered
+    if [[ -n "${SSHFS_MOUNT:-}" ]]; then
+        if command -v fusermount &>/dev/null; then
+            fusermount -uz "$SSHFS_MOUNT" 2>/dev/null || true
+        else
+            umount "$SSHFS_MOUNT" 2>/dev/null || true
+        fi
+        rmdir "$SSHFS_MOUNT" 2>/dev/null || true
+        SSHFS_MOUNT=""
+    fi
 
     # Remove temp files (e.g. askpass helpers)
     for f in "${TEMP_FILES[@]+"${TEMP_FILES[@]}"}"; do
@@ -253,8 +270,12 @@ add_ssh_key() {
     local key_name
     key_name="$(basename "$key_path")"
 
-    # Check if key is already loaded
-    if ssh-add -l 2>/dev/null | grep -qF "$key_path"; then
+    # Check if key is already loaded by comparing fingerprints.
+    # ssh-add -l prints fingerprints; ssh-keygen -lf extracts the
+    # fingerprint of the key file — path matching is unreliable.
+    local key_fp
+    key_fp="$(ssh-keygen -lf "$key_path" 2>/dev/null | awk '{print $2}')"
+    if [[ -n "$key_fp" ]] && ssh-add -l 2>/dev/null | awk '{print $2}' | grep -qF "$key_fp"; then
         info "SSH key already in agent: $key_name"
         return 0
     fi
@@ -361,13 +382,15 @@ backup_lftp() {
     # Solution: write a minimal wrapper that hard-codes the socket path, so
     # the child ssh process always finds the agent regardless of environment.
     local ssh_wrapper
-    ssh_wrapper="$(mktemp /tmp/.lftp-ssh-wrap.XXXXXX)"
+    ssh_wrapper="$(mktemp)"
     TEMP_FILES+=("$ssh_wrapper")
     chmod 700 "$ssh_wrapper"
     cat > "$ssh_wrapper" <<WRAPPER
 #!/bin/sh
 export SSH_AUTH_SOCK="${SSH_AUTH_SOCK}"
-exec ssh -a -x -p ${port} -o BatchMode=yes -o StrictHostKeyChecking=accept-new "\$@"
+# StrictHostKeyChecking=yes — the host key must already be in known_hosts.
+# Do a manual "ssh user@host" first to accept the key before running backups.
+exec ssh -a -x -p ${port} -o BatchMode=yes -o StrictHostKeyChecking=yes "\$@"
 WRAPPER
     local sftp_cmd="${ssh_wrapper}"
 
@@ -403,27 +426,16 @@ backup_sshfs_rsync() {
     require_cmd rsync
     info "[$TARGET_NAME] Using sshfs + local rsync (lftp not available)"
 
-    local mount_point
-    mount_point="$(mktemp -d /tmp/.backup-mount.XXXXXX)"
-    TEMP_FILES+=("$mount_point")
-
-    # Unmount helper (handles both Linux and macOS)
-    _umount() {
-        if command -v fusermount &>/dev/null; then
-            fusermount -uz "$mount_point" 2>/dev/null || true
-        else
-            umount "$mount_point" 2>/dev/null || true
-        fi
-        rmdir "$mount_point" 2>/dev/null || true
-    }
-    trap "_umount; cleanup" EXIT
+    # Register mount point in the global variable so the single centralized
+    # cleanup handler unmounts it — no local trap override needed.
+    SSHFS_MOUNT="$(mktemp -d)"
 
     local ssh_opts
     ssh_opts="$(build_ssh_opts "$port")"
 
     sshfs \
         -o BatchMode=yes,reconnect,ServerAliveInterval=60,${ssh_opts// /,} \
-        "${user}@${host}:${remote_dir}" "$mount_point"
+        "${user}@${host}:${remote_dir}" "$SSHFS_MOUNT"
 
     rsync \
         --archive \
@@ -433,11 +445,18 @@ backup_sshfs_rsync() {
         --delete-after \
         --checksum \
         --stats \
-        "${mount_point}/" \
+        "${SSHFS_MOUNT}/" \
         "${local_dir}/" \
         2>&1 | tee -a "$LOG_FILE"
 
-    _umount
+    # Unmount now (cleanup will also attempt this as a safety net)
+    if command -v fusermount &>/dev/null; then
+        fusermount -uz "$SSHFS_MOUNT" 2>/dev/null || true
+    else
+        umount "$SSHFS_MOUNT" 2>/dev/null || true
+    fi
+    rmdir "$SSHFS_MOUNT" 2>/dev/null || true
+    SSHFS_MOUNT=""
 }
 
 
@@ -453,7 +472,7 @@ backup_restic() {
     [[ ${#RESTIC_BACKUP_PATHS[@]} -gt 0 ]] || die "RESTIC_BACKUP_PATHS is empty in main.conf"
 
     if $DRY_RUN; then
-        info "Restic: skipping snapshot — restic backup has no dry-run mode"
+        info "Restic: skipping snapshot — restic has no dry-run mode"
         return 0
     fi
 
@@ -462,7 +481,8 @@ backup_restic() {
     info "Paths: ${RESTIC_BACKUP_PATHS[*]}"
 
     # Password via FIFO — never written to disk, lives only in the kernel
-    # pipe buffer. Same pattern as the ssh-add askpass helper.
+    # pipe buffer. A fresh FIFO is created for each restic invocation
+    # (backup + optional forget) so the background write always has a reader.
     _restic_run() {
         # Usage: _restic_run [subcommand...] [extra args...]
         # Creates a fresh FIFO, feeds the password into it, runs restic.
@@ -471,14 +491,13 @@ backup_restic() {
         pw_fifo="${pw_dir}/pw"
         mkfifo -m 600 "$pw_fifo"
 
-        # Background write — will block on open until restic reads the FIFO
+        # Background write blocks until restic opens the FIFO for reading
         printf '%s' "$(keepass_get "$RESTIC_KEEPASS_ENTRY")" > "$pw_fifo" &
-
-        restic --repo "$RESTIC_REPO" --password-file "$pw_fifo" "$@" \
-            2>&1 | tee -a "$LOG_FILE"
+        restic --repo "$RESTIC_REPO" --password-file "$pw_fifo" "$@"             2>&1 | tee -a "$LOG_FILE"
         local status=${PIPESTATUS[0]}
-
-        rm -f "$pw_fifo"; rmdir "$pw_dir" 2>/dev/null || true
+        
+        rm -f "$pw_fifo"
+        rmdir "$pw_dir" 2>/dev/null || true
         return $status
     }
 
@@ -638,17 +657,24 @@ main() {
     # Prevent concurrent runs (e.g. launchd firing a missed scheduled job at
     # the same time as a manual launchctl start).  PID lets us detect stale
     # locks left by a hard crash rather than a clean exit.
-    if [[ -f "$LOCK_FILE" ]]; then
-        local old_pid
+    # Atomic lock acquisition using noclobber (O_EXCL) — no TOCTOU window.
+    # The lock dir is user-private so symlink attacks from other users
+    # are not possible.
+    mkdir -p "$(dirname "$LOCK_FILE")"
+    local old_pid
+    if ( set -o noclobber; printf '%s' "$$" > "$LOCK_FILE" ) 2>/dev/null; then
+        : # lock acquired
+    else
         old_pid="$(cat "$LOCK_FILE" 2>/dev/null)"
         if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
             die "Another backup instance is already running (PID $old_pid). If this is stale, remove $LOCK_FILE"
         else
             warn "Removing stale lock file (PID ${old_pid:-unknown} no longer running)"
             rm -f "$LOCK_FILE"
+            ( set -o noclobber; printf '%s' "$$" > "$LOCK_FILE" ) \
+                || die "Failed to acquire lock after removing stale file"
         fi
     fi
-    printf '%s' "$$" > "$LOCK_FILE"
 
     info "═══════════════════════════════════════════════════════════"
     info "  backup.sh  —  $(date '+%A %d %B %Y  %H:%M:%S %Z')"
