@@ -19,3 +19,41 @@ SSH_KEY_DEFAULT="$HOME/.ssh/id_ed25519"
 
 # Optional: extra SSH options applied to every connection.
 # SSH_GLOBAL_OPTS="-o StrictHostKeyChecking=accept-new"
+
+# =============================================================================
+# Restic snapshot (local machine → remote archive)
+# Runs as the final step, after all SSH targets have completed.
+# =============================================================================
+
+# Set to "true" to enable
+RESTIC_ENABLED="false"
+
+# Restic repository URI — any backend restic/rclone supports
+RESTIC_REPO="rclone:gdrive:backup"
+
+# KeePass entry path for the restic repository password
+RESTIC_KEEPASS_ENTRY="Cloud/restic repo password"
+
+# Paths to include in the snapshot (bash array)
+RESTIC_BACKUP_PATHS=(
+    "$HOME"
+)
+
+# Exclusion patterns (bash array — each entry becomes one --exclude flag)
+RESTIC_EXCLUDES=(
+    "**/.Trash/"
+    "**/.cache/"
+)
+
+# Files whose presence causes their directory to be excluded (bash array)
+RESTIC_EXCLUDE_IF_PRESENT=(
+    ".nobackup"
+)
+
+# Optional: retention policy passed to "restic forget --prune" after each backup.
+# Leave empty to skip pruning entirely.
+# Example: keep 7 daily, 5 weekly, 12 monthly snapshots
+# RESTIC_FORGET_OPTS="--keep-daily 7 --keep-weekly 5 --keep-monthly 12"
+
+# Optional: extra flags appended to the restic backup command
+# RESTIC_EXTRA_OPTS="--verbose"

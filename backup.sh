@@ -440,6 +440,91 @@ backup_sshfs_rsync() {
     _umount
 }
 
+
+# ─── Restic snapshot ──────────────────────────────────────────────────────────
+
+backup_restic() {
+    [[ "${RESTIC_ENABLED:-false}" == "true" ]] || return 0
+
+    require_cmd restic
+
+    [[ -n "${RESTIC_REPO:-}" ]]            || die "RESTIC_REPO not set in main.conf"
+    [[ -n "${RESTIC_KEEPASS_ENTRY:-}" ]]   || die "RESTIC_KEEPASS_ENTRY not set in main.conf"
+    [[ ${#RESTIC_BACKUP_PATHS[@]} -gt 0 ]] || die "RESTIC_BACKUP_PATHS is empty in main.conf"
+
+    if $DRY_RUN; then
+        info "Restic: skipping snapshot — restic backup has no dry-run mode"
+        return 0
+    fi
+
+    info "──── Restic snapshot ────────────────────────────────────────"
+    info "Repo:  $RESTIC_REPO"
+    info "Paths: ${RESTIC_BACKUP_PATHS[*]}"
+
+    # Password via FIFO — never written to disk, lives only in the kernel
+    # pipe buffer. Same pattern as the ssh-add askpass helper.
+    _restic_run() {
+        # Usage: _restic_run [subcommand...] [extra args...]
+        # Creates a fresh FIFO, feeds the password into it, runs restic.
+        local pw_dir pw_fifo
+        pw_dir="$(mktemp -d)"
+        pw_fifo="${pw_dir}/pw"
+        mkfifo -m 600 "$pw_fifo"
+
+        # Background write — will block on open until restic reads the FIFO
+        printf '%s' "$(keepass_get "$RESTIC_KEEPASS_ENTRY")" > "$pw_fifo" &
+
+        restic --repo "$RESTIC_REPO" --password-file "$pw_fifo" "$@" \
+            2>&1 | tee -a "$LOG_FILE"
+        local status=${PIPESTATUS[0]}
+
+        rm -f "$pw_fifo"; rmdir "$pw_dir" 2>/dev/null || true
+        return $status
+    }
+
+    # Build the backup command arguments as an array
+    local -a backup_args=(backup)
+
+    for _path in "${RESTIC_BACKUP_PATHS[@]}"; do
+        backup_args+=("$_path")
+    done
+
+    for _excl in "${RESTIC_EXCLUDES[@]+"${RESTIC_EXCLUDES[@]}"}"; do
+        backup_args+=(--exclude="$_excl")
+    done
+
+    for _marker in "${RESTIC_EXCLUDE_IF_PRESENT[@]+"${RESTIC_EXCLUDE_IF_PRESENT[@]}"}"; do
+        backup_args+=(--exclude-if-present="$_marker")
+    done
+
+    if [[ -n "${RESTIC_EXTRA_OPTS:-}" ]]; then
+        read -r -a _extra <<< "$RESTIC_EXTRA_OPTS"
+        backup_args+=("${_extra[@]}")
+    fi
+
+    local start_ts end_ts elapsed
+    start_ts=$(date +%s)
+
+    _restic_run "${backup_args[@]}"
+    local restic_status=$?
+
+    end_ts=$(date +%s); elapsed=$(( end_ts - start_ts ))
+
+    if [[ $restic_status -eq 0 ]]; then
+        info "Restic snapshot done in ${elapsed}s ✓"
+    else
+        err "Restic exited with status $restic_status"
+        return $restic_status
+    fi
+
+    # Optional: forget old snapshots according to retention policy
+    if [[ -n "${RESTIC_FORGET_OPTS:-}" ]]; then
+        info "Running restic forget --prune..."
+        read -r -a _forget <<< "$RESTIC_FORGET_OPTS"
+        _restic_run forget --prune "${_forget[@]}"
+    fi
+}
+
 # ─── Run a single target ──────────────────────────────────────────────────────
 
 run_target() {
@@ -639,6 +724,12 @@ main() {
             EXIT_CODE=1
         fi
     done
+
+    # Restic snapshot — runs after all SSH targets regardless of their status
+    if ! backup_restic; then
+        (( failed++ )) || true
+        EXIT_CODE=1
+    fi
 
     info "═══════════════════════════════════════════════════════════"
     info "  Summary: ${success} succeeded, ${failed} failed"
