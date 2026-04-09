@@ -31,6 +31,7 @@ MASTER_PASSWORD=""
 SSH_AGENT_PID_STARTED=""   # PID of agent we launched (empty = we reused existing)
 TEMP_FILES=()              # Temp files to clean up on exit
 EXIT_CODE=0
+LOCK_FILE="${TMPDIR:-/tmp}/backup.lock"
 
 # ─── Colour output (disabled when not a TTY) ──────────────────────────────────
 
@@ -69,6 +70,9 @@ cleanup() {
     # Scrub sensitive variable from memory (best-effort in bash)
     MASTER_PASSWORD="$(head -c 256 /dev/urandom | base64)"
     unset MASTER_PASSWORD
+
+    # Release lock
+    rm -f "$LOCK_FILE"
 
     [[ $exit_status -ne 0 ]] && err "Backup exited with status $exit_status"
 }
@@ -165,12 +169,27 @@ prompt_master_password() {
         # Non-interactive (launched by systemd/launchd) → GUI dialog
         info "Non-interactive session detected — opening GUI password prompt"
         if [[ "$OSTYPE" == darwin* ]]; then
-            MASTER_PASSWORD="$(osascript \
-                -e 'Tell application "System Events"' \
-                -e '  activate' \
-                -e '  set pw to text returned of (display dialog "Backup — Enter KeePass master password:" with hidden answer default answer "" buttons {"Cancel","OK"} default button "OK" with title "Backup Tool")' \
-                -e 'end tell' \
-                -e 'return pw')" || die "Password prompt cancelled"
+            # Retry up to 10 times with a 6-second gap (total 60s) to handle
+            # the case where the machine just woke from sleep and the window
+            # server isn't ready yet (osascript error -1712 = AppleEvent timeout).
+            local _pw _attempt
+            for _attempt in {1..10}; do
+                _pw="$(osascript \
+                    -e 'Tell application "System Events"' \
+                    -e '  activate' \
+                    -e '  set pw to text returned of (display dialog "Backup — Enter KeePass master password:" with hidden answer default answer "" buttons {"Cancel","OK"} default button "OK" with title "Backup Tool")' \
+                    -e 'end tell' \
+                    -e 'return pw' 2>&1)" && break
+                # -1712 = AppleEvent timeout (display not ready); anything else
+                # is a real error (e.g. user clicked Cancel → exit immediately)
+                if [[ "$_pw" != *"-1712"* ]]; then
+                    die "Password prompt cancelled or failed: $_pw"
+                fi
+                warn "Display not ready (attempt $_attempt/10) — retrying in 6s"
+                sleep 6
+            done
+            [[ "$_pw" == *"-1712"* ]] && die "Display never became ready after 60s"
+            MASTER_PASSWORD="$_pw"
         elif command -v zenity &>/dev/null; then
             MASTER_PASSWORD="$(zenity --password \
                 --title="Backup Tool — KeePass" \
@@ -530,6 +549,21 @@ parse_args() {
 
 main() {
     parse_args "$@"
+
+    # Prevent concurrent runs (e.g. launchd firing a missed scheduled job at
+    # the same time as a manual launchctl start).  PID lets us detect stale
+    # locks left by a hard crash rather than a clean exit.
+    if [[ -f "$LOCK_FILE" ]]; then
+        local old_pid
+        old_pid="$(cat "$LOCK_FILE" 2>/dev/null)"
+        if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
+            die "Another backup instance is already running (PID $old_pid). If this is stale, remove $LOCK_FILE"
+        else
+            warn "Removing stale lock file (PID ${old_pid:-unknown} no longer running)"
+            rm -f "$LOCK_FILE"
+        fi
+    fi
+    printf '%s' "$$" > "$LOCK_FILE"
 
     info "═══════════════════════════════════════════════════════════"
     info "  backup.sh  —  $(date '+%A %d %B %Y  %H:%M:%S %Z')"
