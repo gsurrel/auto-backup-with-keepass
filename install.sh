@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# install.sh — One-shot setup for backup-tool
+# install.sh — One-shot setup for auto-backup-with-keypass
 # =============================================================================
 set -euo pipefail
 
@@ -14,8 +14,8 @@ ok()   { echo -e "${GREEN}  ✓${RESET} $*"; }
 warn() { echo -e "${YELLOW}  !${RESET} $*"; }
 
 echo
-echo "  backup-tool installer"
-echo "  ─────────────────────"
+echo "  auto-backup-with-keypass installer"
+echo "  ──────────────────────────────────"
 echo
 
 # 1. Install the script

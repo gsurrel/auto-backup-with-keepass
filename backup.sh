@@ -14,6 +14,7 @@
 
 set -euo pipefail
 IFS=$'\n\t'
+ulimit -c 0   # disable core dumps — script handles sensitive credentials
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
 
@@ -98,7 +99,11 @@ Run: cp $CONFIG_DIR/main.conf.example $MAIN_CONFIG  and edit it."
     local perms
     perms="$(stat -c '%a' "$MAIN_CONFIG" 2>/dev/null || stat -f '%p' "$MAIN_CONFIG" 2>/dev/null | tail -c 4)"
     if [[ "$perms" != "600" && "$perms" != "0600" ]]; then
-        warn "Config file $MAIN_CONFIG should have permissions 600 (currently $perms)"
+        if [[ -n "${BACKUP_ALLOW_INSECURE_CONFIG:-}" ]]; then
+            warn "Config file $MAIN_CONFIG has insecure permissions ($perms) — continuing because BACKUP_ALLOW_INSECURE_CONFIG is set"
+        else
+            die "Config file $MAIN_CONFIG has permissions $perms — must be 600.\nFix with: chmod 600 \"$MAIN_CONFIG\"\nOr set BACKUP_ALLOW_INSECURE_CONFIG=1 to skip this check (not recommended)."
+        fi
     fi
 
     # shellcheck source=/dev/null
@@ -237,25 +242,38 @@ add_ssh_key() {
 
     info "Adding SSH key to agent: $key_name"
 
-    # Create a minimal askpass helper that echoes the key password
-    local askpass
-    askpass="$(mktemp /tmp/.ssh-askpass.XXXXXX)"
-    TEMP_FILES+=("$askpass")
+    # Use a FIFO (named pipe) as the askpass helper so the passphrase is never
+    # written to a regular disk file. The passphrase travels through the pipe
+    # in-kernel only. A secure mktemp dir is used so no predictable /tmp path.
+    local fifo_dir askpass fifo
+    fifo_dir="$(mktemp -d)"
+    askpass="${fifo_dir}/askpass"
+    fifo="${fifo_dir}/pw"
+    mkfifo -m 600 "$fifo"
+    printf '#!/bin/sh\ncat "%s"\n' "$fifo" > "$askpass"
     chmod 700 "$askpass"
-    # Write password via printf to avoid shell quoting issues
-    printf '#!/bin/sh\nprintf "%%s" "%s"\n' \
-        "$(printf '%s' "$key_password" | sed "s/'/'\\\\''/g")" > "$askpass"
+    TEMP_FILES+=("$askpass" "$fifo" "$fifo_dir")
 
+    # Secure temp file for ssh-add stderr (no fixed /tmp path)
+    local ssh_add_err
+    ssh_add_err="$(mktemp)"
+    TEMP_FILES+=("$ssh_add_err")
+
+    # Feed passphrase into the FIFO in the background, then run ssh-add
+    printf '%s' "$key_password" > "$fifo" &
     SSH_ASKPASS="$askpass" \
     SSH_ASKPASS_REQUIRE="force" \
     DISPLAY="${DISPLAY:-:0}" \
-        ssh-add "$key_path" </dev/null 2>/tmp/ssh-add-err \
+        ssh-add "$key_path" </dev/null 2>"$ssh_add_err" \
         || {
-            warn "ssh-add failed for $key_name: $(cat /tmp/ssh-add-err)"
+            warn "ssh-add failed for $key_name: $(cat "$ssh_add_err")"
+            rm -f "$ssh_add_err" "$askpass" "$fifo"
+            rmdir "$fifo_dir" 2>/dev/null || true
             return 1
         }
 
-    rm -f /tmp/ssh-add-err
+    rm -f "$ssh_add_err" "$askpass" "$fifo"
+    rmdir "$fifo_dir" 2>/dev/null || true
     info "Key added: $key_name"
 }
 
@@ -287,23 +305,24 @@ backup_rsync() {
     [[ -n "$BANDWIDTH_LIMIT" && "$BANDWIDTH_LIMIT" != "0" ]] \
         && bwlimit_opt="--bwlimit=$BANDWIDTH_LIMIT"
 
-    # Trailing slash on remote ensures we sync *contents* of dir
-    rsync \
-        --archive \
-        --verbose \
-        --compress \
-        --human-readable \
-        --partial \
-        --delete \
-        --delete-after \
-        --checksum \
-        --stats \
-        ${bwlimit_opt:+"$bwlimit_opt"} \
-        ${RSYNC_EXTRA_OPTS:+$RSYNC_EXTRA_OPTS} \
-        -e "ssh $ssh_opts" \
-        "${user}@${host}:${remote_dir}/" \
-        "${local_dir}/" \
-        2>&1 | tee -a "$LOG_FILE"
+    # Build rsync command as an array so config-supplied extra opts are
+    # word-split into separate arguments without unquoted string expansion.
+    local -a rsync_cmd=(
+        rsync
+        --archive --verbose --compress --human-readable
+        --partial --delete --delete-after --checksum --stats
+        -e "ssh $ssh_opts"
+    )
+    [[ -n "$bwlimit_opt" ]] && rsync_cmd+=("$bwlimit_opt")
+    if [[ -n "${RSYNC_EXTRA_OPTS:-}" ]]; then
+        read -r -a _extra <<< "$RSYNC_EXTRA_OPTS"
+        rsync_cmd+=("${_extra[@]}")
+    fi
+    $DRY_RUN && rsync_cmd+=(--dry-run)
+    rsync_cmd+=("${user}@${host}:${remote_dir}/" "${local_dir}/")
+
+    # Trailing slash on remote ensures we sync *contents* of the dir
+    "${rsync_cmd[@]}" 2>&1 | tee -a "$LOG_FILE"
 }
 
 backup_lftp() {
@@ -496,7 +515,7 @@ parse_args() {
             -c|--config)    CONFIG_DIR="$2"; shift 2;;
             -t|--target)    ONLY_TARGETS+=("$2"); shift 2;;
             -l|--list)      LIST_ONLY=true; shift;;
-            -n|--dry-run)   DRY_RUN=true; RSYNC_EXTRA_OPTS="--dry-run"; shift;;
+            -n|--dry-run)   DRY_RUN=true; shift;;
             -v|--verbose)   set -x; shift;;
             -h|--help)      usage;;
             *)              die "Unknown option: $1";;
