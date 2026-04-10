@@ -186,26 +186,14 @@ prompt_master_password() {
         # Non-interactive (launched by systemd/launchd) → GUI dialog
         info "Non-interactive session detected — opening GUI password prompt"
         if [[ "$OSTYPE" == darwin* ]]; then
-            # Retry up to 10 times with a 6-second gap (total 60s) to handle
-            # the case where the machine just woke from sleep and the window
-            # server isn't ready yet (osascript error -1712 = AppleEvent timeout).
-            local _pw _attempt
-            for _attempt in {1..10}; do
-                _pw="$(osascript \
-                    -e 'Tell application "System Events"' \
-                    -e '  activate' \
-                    -e '  set pw to text returned of (display dialog "Backup — Enter KeePass master password:" with hidden answer default answer "" buttons {"Cancel","OK"} default button "OK" with title "Backup Tool")' \
-                    -e 'end tell' \
-                    -e 'return pw' 2>&1)" && break
-                # -1712 = AppleEvent timeout (display not ready); anything else
-                # is a real error (e.g. user clicked Cancel → exit immediately)
-                if [[ "$_pw" != *"-1712"* ]]; then
-                    die "Password prompt cancelled or failed: $_pw"
-                fi
-                warn "Display not ready (attempt $_attempt/10) — retrying in 6s"
-                sleep 6
-            done
-            [[ "$_pw" == *"-1712"* ]] && die "Display never became ready after 60s"
+            local _pw
+            _pw="$(osascript \
+                -e 'Tell application "System Events"' \
+                -e '  activate' \
+                -e '  set pw to text returned of (display dialog "Backup — Enter KeePass master password:" with hidden answer default answer "" buttons {"Cancel","OK"} default button "OK" with title "Backup Tool")' \
+                -e 'end tell' \
+                -e 'return pw' 2>&1)" \
+                || die "Password prompt failed or display not ready — will retry at next trigger: $_pw"
             MASTER_PASSWORD="$_pw"
         elif command -v zenity &>/dev/null; then
             MASTER_PASSWORD="$(zenity --password \
@@ -615,6 +603,7 @@ Options:
   -l, --list           List configured targets and exit
   -n, --dry-run        Pass --dry-run to rsync / --dry-run to lftp
   -v, --verbose        Increase verbosity
+  -f, --force          Bypass daily-run guard (run even if already attempted today)
   -h, --help           Show this help
 
 If no TARGET is given, all enabled targets are run.
@@ -624,6 +613,7 @@ Examples:
   $SCRIPT_NAME -t webserver           # back up only 'webserver'
   $SCRIPT_NAME -t webserver -t nas    # back up two specific targets
   $SCRIPT_NAME --list                 # list targets
+  $SCRIPT_NAME --force                # force run even if already attempted today
 EOF
     exit 0
 }
@@ -631,6 +621,7 @@ EOF
 ONLY_TARGETS=()
 DRY_RUN=false
 LIST_ONLY=false
+FORCE_RUN=false
 
 parse_args() {
     while [[ $# -gt 0 ]]; do
@@ -639,6 +630,7 @@ parse_args() {
             -t|--target)    ONLY_TARGETS+=("$2"); shift 2;;
             -l|--list)      LIST_ONLY=true; shift;;
             -n|--dry-run)   DRY_RUN=true; shift;;
+            -f|--force)     FORCE_RUN=true; shift;;
             -v|--verbose)   set -x; shift;;
             -h|--help)      usage;;
             *)              die "Unknown option: $1";;
@@ -649,10 +641,58 @@ parse_args() {
     TARGETS_DIR="$CONFIG_DIR/targets"
 }
 
+# ─── Daily-run guard (automated mode only) ────────────────────────────────────
+# Returns 0 if we should SKIP (already attempted today in automated mode)
+# Returns 1 if we should PROCEED (interactive, --force, or not yet attempted)
+should_skip_automated_run() {
+    # Always proceed if running interactively or with --force
+    if [[ -t 0 ]] || $FORCE_RUN; then
+        return 1  # Do NOT skip
+    fi
+
+    local ATTEMPTED_STAMP="${BACKUP_LOG_DIR:-$HOME/.local/share/backup}/last_attempted_date"
+    local TODAY
+    TODAY="$(date +%Y-%m-%d)"
+
+    # Robust check: handle missing file, permission errors, trailing whitespace
+    if [[ -r "$ATTEMPTED_STAMP" ]]; then
+        local last_attempted
+        last_attempted="$(< "$ATTEMPTED_STAMP" 2>/dev/null | tr -d '[:space:]')" || true
+        if [[ "$last_attempted" == "$TODAY" ]]; then
+            return 0  # Skip: already attempted today in automated mode
+        fi
+    fi
+
+    return 1  # Proceed: not yet attempted today
+}
+
+# Mark that a backup attempt has been made today (for automated mode)
+mark_backup_attempted() {
+    local ATTEMPTED_STAMP="${BACKUP_LOG_DIR:-$HOME/.local/share/backup}/last_attempted_date"
+    local TODAY
+    TODAY="$(date +%Y-%m-%d)"
+
+    # Write attempt stamp AFTER password validation succeeds
+    # This prevents repeated prompts even if backup operations fail later.
+    # Stamp contains only date (no sensitive data); permissions enforced by umask 077.
+    if ! printf '%s' "$TODAY" > "$ATTEMPTED_STAMP" 2>/dev/null || ! chmod 600 "$ATTEMPTED_STAMP" 2>/dev/null; then
+        warn "Could not write attempt stamp ($ATTEMPTED_STAMP) — may prompt again this session"
+        return 1
+    fi
+    info "Marked backup as attempted for today: $TODAY"
+    return 0
+}
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 main() {
     parse_args "$@"
+
+    # ── Daily-run guard for automated (non-interactive) runs ──────────────────
+    if should_skip_automated_run; then
+        info "Backup already attempted today — exiting (automated mode). Use --force to override."
+        exit 0
+    fi
 
     # Prevent concurrent runs (e.g. launchd firing a missed scheduled job at
     # the same time as a manual launchctl start).  PID lets us detect stale
@@ -678,6 +718,8 @@ main() {
 
     info "═══════════════════════════════════════════════════════════"
     info "  backup.sh  —  $(date '+%A %d %B %Y  %H:%M:%S %Z')"
+    [[ -t 0 ]] && info "  Mode: Interactive (user-invoked)" || info "  Mode: Automated (scheduler-invoked)"
+    $FORCE_RUN && info "  Force mode: enabled"
     info "═══════════════════════════════════════════════════════════"
 
     check_dependencies
@@ -732,12 +774,21 @@ main() {
     # Prompt for KeePass master password ONCE before starting
     prompt_master_password
 
-    # Validate password against KeePass DB early
+    # Validate password against KeePass DB early (before marking as attempted)
     info "Verifying KeePass database..."
-    printf '%s\n' "$MASTER_PASSWORD" \
-        | keepassxc-cli ls -q "$KEEPASS_DB" &>/dev/null \
-        || die "Failed to open KeePass database — wrong master password?"
+    if ! printf '%s\n' "$MASTER_PASSWORD" | keepassxc-cli ls -q "$KEEPASS_DB" &>/dev/null; then
+        err "Failed to open KeePass database — wrong master password?"
+        # Do NOT write stamp file: allow retry if user entered wrong password
+        exit 1
+    fi
     info "KeePass database unlocked ✓"
+
+    # Mark as attempted AFTER password validation succeeds
+    # This prevents repeated prompts even if backup operations fail later.
+    # Only mark when running in automated mode (not interactive, not --force)
+    if ! [[ -t 0 ]] && ! $FORCE_RUN; then
+        mark_backup_attempted || true  # Non-fatal: log warning but continue
+    fi
 
     setup_ssh_agent
 
@@ -760,6 +811,18 @@ main() {
     info "═══════════════════════════════════════════════════════════"
     info "  Summary: ${success} succeeded, ${failed} failed"
     info "═══════════════════════════════════════════════════════════"
+
+    # Update success stamp for monitoring/alerting (only if backup succeeded)
+    if [[ $EXIT_CODE -eq 0 ]]; then
+        local SUCCESS_STAMP="${BACKUP_LOG_DIR:-$HOME/.local/share/backup}/last_success_date"
+        local TODAY
+        TODAY="$(date +%Y-%m-%d)"
+        if printf '%s' "$TODAY" > "$SUCCESS_STAMP" 2>/dev/null && chmod 600 "$SUCCESS_STAMP" 2>/dev/null; then
+            info "Backup completed successfully — updated success stamp"
+        else
+            warn "Could not update success stamp ($SUCCESS_STAMP)"
+        fi
+    fi
 
     exit $EXIT_CODE
 }
