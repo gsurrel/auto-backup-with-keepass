@@ -657,7 +657,7 @@ should_skip_automated_run() {
     # Robust check: handle missing file, permission errors, trailing whitespace
     if [[ -r "$ATTEMPTED_STAMP" ]]; then
         local last_attempted
-        last_attempted="$(< "$ATTEMPTED_STAMP" 2>/dev/null | tr -d '[:space:]')" || true
+        last_attempted="$(tr -d '[:space:]' < "$ATTEMPTED_STAMP" 2>/dev/null)"
         if [[ "$last_attempted" == "$TODAY" ]]; then
             return 0  # Skip: already attempted today in automated mode
         fi
